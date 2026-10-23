@@ -1389,7 +1389,8 @@
                     statsFailed: false,
                     floor: Math.max(floor || 0, tagFloor(item)),
                 });
-                if (taken.stats) this.noteStats(taken.stats);
+                // Works the viewer's settings hide go last and must not raise the threshold.
+                if (taken.stats && !taken.unviewable) this.noteStats(taken.stats);
                 return taken;
             }
 
@@ -1812,7 +1813,9 @@
                         return true;
                     }
                     if (!page.items.length) return true;
-                    source.buffer = page.items;
+                    // A copy: the page is shared with listingCache, and the buffer is
+                    // emptied as works are taken.
+                    source.buffer = page.items.slice();
                 }
             }
 
@@ -1999,7 +2002,9 @@
 
             async getPage(page) {
                 clearTimeout(this.prefetchTimer);
-                const end = Math.min(page, this.lastPage || page) * PAGE_SIZE;
+                // Past the ranked pages there is nothing to rank for.
+                if (page > this.lastPage) return [];
+                const end = page * PAGE_SIZE;
                 // Exact counts can take long when pixiv throttles: once the page is filled
                 // and requests stall, it is served by estimate; the rest keeps loading.
                 this.waitStarted = 0;
@@ -2013,7 +2018,6 @@
                         this.ensure(end + PAGE_SIZE).catch(() => {});
                     }, PREFETCH_DELAY_MS);
                 }
-                if (page > this.lastPage) return [];
                 return this.ranked.slice(end - PAGE_SIZE, end).map(stripInternal);
             }
 
@@ -2129,13 +2133,21 @@
                 const end = offset + limit;
                 this.target = Math.max(this.target, end);
                 this.waitStarted = 0;
-                await Promise.race([this.countsSettled(), this.untilStalled()]);
+                const settled = this.countsSettled();
+                settled.catch(() => {});
+                await Promise.race([settled, this.untilStalled()]);
                 this.waitStarted = 0;
                 this.hurried = false;
                 this.resortTail();
                 this.served = Math.max(this.served, Math.min(end, this.ranked.length));
                 if (!this.statsQueue.length && !this.statsActive) this.state.phase = 'ready';
                 this.emit();
+                // Served by estimate: the counts still loading end the ranking later.
+                settled.then(() => {
+                    if (this.state.phase !== 'ranking' || this.statsQueue.length || this.statsActive) return;
+                    this.state.phase = 'ready';
+                    this.emit();
+                }, () => {});
                 const page = this.ranked.slice(offset, end);
                 return byIds ? this.answerIds(request, page) : this.answerOffset(fetchOriginal, page);
             }
