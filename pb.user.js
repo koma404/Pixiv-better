@@ -4,7 +4,7 @@
 // @name:ja        Pixiv Sort
 // @name:zh-CN     Pixiv Sort
 // @namespace      https://github.com/koma404/Pixiv-better
-// @version        1.3.4
+// @version        1.3.5
 // @description    Makes pixiv's own "Sort by popularity" work without Premium, and adds it to artist pages and bookmarks. Works are ranked right in your browser by real bookmark counts, as pixiv does, or by views.
 // @description:ru Включает штатную «Сортировку по популярности» на pixiv без Premium и добавляет её на страницы авторов и в закладки. Работы ранжируются прямо в браузере по реальному числу закладок, как у самого pixiv, или по просмотрам.
 // @description:ja pixiv 標準の「人気順」を Premium なしで使えるようにし、ユーザーページとブックマークにも追加します。pixiv と同じく実際のブックマーク数で、または閲覧数でブラウザ内で並べ替えます。
