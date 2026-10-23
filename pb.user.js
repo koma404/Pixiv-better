@@ -64,12 +64,16 @@
     // in the page itself, whatever context the userscript manager uses.
     function injectPageWorld() {
         const inject = () => {
-            const script = document.createElement('script');
-            script.textContent = `(${pageWorld.toString()})();`;
-            (document.head || document.documentElement).appendChild(script);
-            script.remove();
-            // Without inline scripts (e.g. a future CSP) run it here as a best effort.
-            if (document.documentElement.getAttribute('data-pixiv-sort') !== 'page') pageWorld();
+            const root = document.head || document.documentElement;
+            if (root) {
+                const script = document.createElement('script');
+                script.textContent = `(${pageWorld.toString()})();`;
+                root.appendChild(script);
+                script.remove();
+            }
+            // Without inline scripts (e.g. a future CSP, or no root element to
+            // attach to) run it here as a best effort.
+            if (!document.documentElement || document.documentElement.getAttribute('data-pixiv-sort') !== 'page') pageWorld();
         };
         if (document.documentElement) inject();
         else document.addEventListener('readystatechange', inject, { once: true });
@@ -89,7 +93,14 @@
 
         if (window.__pixivSortInstalled) return;
         window.__pixivSortInstalled = true;
-        document.documentElement.setAttribute('data-pixiv-sort', 'page');
+        // At document-start <html> may not exist yet (no documentElement, and
+        // document.documentElement === null). The flag is only a marker for
+        // injectPageWorld, so record it whenever the element appears.
+        const mark = () => {
+            if (document.documentElement) document.documentElement.setAttribute('data-pixiv-sort', 'page');
+        };
+        if (document.documentElement) mark();
+        else document.addEventListener('readystatechange', mark, { once: true });
 
         const nativeFetch = window.fetch;
         // The URL the page was opened with: pixiv's client drops order=popular_* from
@@ -364,7 +375,7 @@
         };
 
         const LANG = (function () {
-            const candidates = [...(navigator.languages || []), navigator.language, document.documentElement.lang];
+            const candidates = [...(navigator.languages || []), navigator.language, document.documentElement && document.documentElement.lang];
             for (const candidate of candidates) {
                 const prefix = String(candidate || '').toLowerCase().slice(0, 2);
                 if (MESSAGES[prefix]) return prefix;
