@@ -731,9 +731,10 @@
             return page;
         }
 
-        // Search pages by URL, in memory and in IndexedDB. Searches are what pixiv limits
-        // most, so switching between "Newest" and "Popular", coming back to a search,
-        // reloading it in another sort order or opening it in a second tab repeats none.
+        // Search pages (and recommendation lists) by URL, in memory and in IndexedDB.
+        // Searches are what pixiv limits most, so switching between "Newest" and
+        // "Popular", coming back to a search, reloading it in another sort order or
+        // opening it in a second tab repeats none.
         const listingCache = {
             map: new Map(),
 
@@ -830,8 +831,12 @@
             return (body && Array.isArray(body.illusts) ? body.illusts : []).filter(isUsableItem);
         }
 
+        function recommendationsUrl(id) {
+            return `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=180`;
+        }
+
         async function getRecommendations(id, signal, priority) {
-            const body = await fetchJson(`/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=180`, { signal, priority });
+            const body = await fetchJson(recommendationsUrl(id), { signal, priority });
             return (body && Array.isArray(body.illusts) ? body.illusts : []).filter(isUsableItem);
         }
 
@@ -1937,14 +1942,26 @@
                 this.graphTask.catch(() => {});
             }
 
+            // Recommendation lists take seconds each and change slowly, so they are kept
+            // with the search pages: a new sort order, a reload or a second tab on the
+            // same search asks for none of them again.
+            async recommendations(id) {
+                const url = recommendationsUrl(id);
+                const cached = await listingCache.load(url);
+                if (cached) return cached;
+                this.state.recs++;
+                const works = await withRetry(() => getRecommendations(id, this.signal, this.priority), this.recommendLimiter, this.signal);
+                listingCache.set(url, works);
+                return works;
+            }
+
             async collectGraph(pool) {
                 const seeds = pool.slice().sort(this.byScore).slice(0, this.graphSeeds);
                 const candidates = new Map();
                 await mapLimit(seeds, GRAPH_PARALLEL, async (seed) => {
                     let works;
                     try {
-                        this.state.recs++;
-                        works = await withRetry(() => getRecommendations(seed.id, this.signal, this.priority), this.recommendLimiter, this.signal);
+                        works = await this.recommendations(seed.id);
                     } catch (error) {
                         if (isAbortError(error)) throw error;
                         return;
