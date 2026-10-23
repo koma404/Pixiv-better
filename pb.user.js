@@ -4,7 +4,7 @@
 // @name:ja        Pixiv Sort
 // @name:zh-CN     Pixiv Sort
 // @namespace      https://github.com/koma404/Pixiv-better
-// @version        1.3.5
+// @version        1.3.6
 // @description    Makes pixiv's own "Sort by popularity" work without Premium, and adds it to artist pages and bookmarks. Works are ranked right in your browser by real bookmark counts, as pixiv does, or by views.
 // @description:ru Включает штатную «Сортировку по популярности» на pixiv без Premium и добавляет её на страницы авторов и в закладки. Работы ранжируются прямо в браузере по реальному числу закладок, как у самого pixiv, или по просмотрам.
 // @description:ja pixiv 標準の「人気順」を Premium なしで使えるようにし、ユーザーページとブックマークにも追加します。pixiv と同じく実際のブックマーク数で、または閲覧数でブラウザ内で並べ替えます。
@@ -239,6 +239,8 @@
         // pixiv's client drops order=popular_* from the URL after a full page load
         // (reload, new tab, link); it is put back within this time.
         const RESTORE_WINDOW_MS = 10000;
+        // The popular order to enter after the reload a new sort order takes.
+        const ENTER_ORDER_KEY = 'pixiv-sort:enter';
 
         const DEFAULT_SETTINGS = {
             sort: 'bookmarks',
@@ -729,9 +731,10 @@
             return page;
         }
 
-        // Search pages by URL, in memory and in IndexedDB. Searches are what pixiv limits
-        // most, so switching between "Newest" and "Popular", coming back to a search,
-        // reloading it in another sort order or opening it in a second tab repeats none.
+        // Search pages (and recommendation lists) by URL, in memory and in IndexedDB.
+        // Searches are what pixiv limits most, so switching between "Newest" and
+        // "Popular", coming back to a search, reloading it in another sort order or
+        // opening it in a second tab repeats none.
         const listingCache = {
             map: new Map(),
 
@@ -828,8 +831,12 @@
             return (body && Array.isArray(body.illusts) ? body.illusts : []).filter(isUsableItem);
         }
 
+        function recommendationsUrl(id) {
+            return `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=180`;
+        }
+
         async function getRecommendations(id, signal, priority) {
-            const body = await fetchJson(`/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=180`, { signal, priority });
+            const body = await fetchJson(recommendationsUrl(id), { signal, priority });
             return (body && Array.isArray(body.illusts) ? body.illusts : []).filter(isUsableItem);
         }
 
@@ -1935,14 +1942,26 @@
                 this.graphTask.catch(() => {});
             }
 
+            // Recommendation lists take seconds each and change slowly, so they are kept
+            // with the search pages: a new sort order, a reload or a second tab on the
+            // same search asks for none of them again.
+            async recommendations(id) {
+                const url = recommendationsUrl(id);
+                const cached = await listingCache.load(url);
+                if (cached) return cached;
+                this.state.recs++;
+                const works = await withRetry(() => getRecommendations(id, this.signal, this.priority), this.recommendLimiter, this.signal);
+                listingCache.set(url, works);
+                return works;
+            }
+
             async collectGraph(pool) {
                 const seeds = pool.slice().sort(this.byScore).slice(0, this.graphSeeds);
                 const candidates = new Map();
                 await mapLimit(seeds, GRAPH_PARALLEL, async (seed) => {
                     let works;
                     try {
-                        this.state.recs++;
-                        works = await withRetry(() => getRecommendations(seed.id, this.signal, this.priority), this.recommendLimiter, this.signal);
+                        works = await this.recommendations(seed.id);
                     } catch (error) {
                         if (isAbortError(error)) throw error;
                         return;
@@ -2323,8 +2342,26 @@
             }
             if (!match) return original();
             return match.engine.respond(match.request, original).catch((error) => {
-                if (!isAbortError(error)) console.warn('[Pixiv Sort]', error);
-                return original();
+                if (!isAbortError(error)) {
+                    console.warn('[Pixiv Sort]', error);
+                    return original();
+                }
+                // The ranking was stopped (the page was left, the cache cleared). pixiv
+                // keeps answers by request, so its own order must not be stored under a
+                // popular request: ranked again while its page is still shown, failed
+                // otherwise (pixiv asks again when it comes back to the page).
+                let again = null;
+                try {
+                    again = popularKind(destinationHref()) ? engineFor(input) : null;
+                } catch (e) {
+                    again = null;
+                }
+                if (!again || again.engine === match.engine) throw error;
+                return again.engine.respond(again.request, original).catch((retryError) => {
+                    if (isAbortError(retryError)) throw retryError;
+                    console.warn('[Pixiv Sort]', retryError);
+                    return original();
+                });
             });
         }
 
@@ -2393,13 +2430,56 @@
             }
         }
 
+        // A new sort order reloads a search in pixiv's own order (see ui.onSortChange) and
+        // the popular order is entered from there, as by a click: a page loaded with
+        // order=popular_* has pixiv drop the order and ask for its pages again, which
+        // could leave pixiv's own order cached under the popular request.
+        function takeEnterOrder() {
+            try {
+                const entry = JSON.parse(sessionStorage.getItem(ENTER_ORDER_KEY) || 'null');
+                sessionStorage.removeItem(ENTER_ORDER_KEY);
+                return entry && typeof entry.href === 'string' && POPULAR_ORDERS.has(entry.order) ? entry : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function rememberEnterOrder(href, order) {
+            try {
+                sessionStorage.setItem(ENTER_ORDER_KEY, JSON.stringify({ href, order }));
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function samePage(a, b) {
+            try {
+                const x = new URL(a, location.href);
+                const y = new URL(b, location.href);
+                return x.pathname === y.pathname && x.search === y.search;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // While the popular order is put back, pixiv removing it is not the user
+        // leaving the page: the ranking pixiv waits for keeps going (see watchPage).
+        let restoringOrder = false;
+
         // A reload, a new tab or a link with order=popular_* loads the page with that
         // order, but pixiv's client removes it right away for free accounts (there is
         // no server redirect). The order is put back as soon as pixiv's store and router
-        // exist, unless the user has started doing something else.
+        // exist, unless the user has started doing something else. After a new sort
+        // order the page loads without it and it is entered the same way.
         function restoreInitialOrder() {
-            if (!isPopularUrl(initialHref)) return;
-            const initial = new URL(initialHref);
+            let target = isPopularUrl(initialHref) ? new URL(initialHref) : null;
+            const entry = takeEnterOrder();
+            if (!target && entry && samePage(entry.href, initialHref)) {
+                target = new URL(initialHref);
+                target.searchParams.set('order', entry.order);
+            }
+            if (!target || isPremium()) return;
             const started = Date.now();
             let userActed = false;
             const onAct = () => {
@@ -2407,20 +2487,36 @@
             };
             window.addEventListener('pointerdown', onAct, { capture: true, once: true });
             window.addEventListener('keydown', onAct, { capture: true, once: true });
+            restoringOrder = true;
+            // Given up: pixiv's removal of the order now counts as leaving the page.
+            const giveUp = () => {
+                restoringOrder = false;
+                if (!isPopularPage()) leavePopular();
+            };
             const tick = () => {
-                if (isPremium() || userActed || Date.now() - started > RESTORE_WINDOW_MS || location.pathname !== initial.pathname) return;
+                if (isPremium() || userActed || Date.now() - started > RESTORE_WINDOW_MS || location.pathname !== target.pathname) {
+                    giveUp();
+                    return;
+                }
                 if (!(window.next && window.next.router) || !premiumView.set(true)) {
                     setTimeout(tick, 100);
                     return;
                 }
                 if (!isPopularUrl(location.href)) {
-                    routeTo(initial, true);
+                    restoringOrder = false;
+                    routeTo(target, true);
                     return;
                 }
                 // Still popular: pixiv may not have normalized the URL yet.
                 setTimeout(tick, 250);
             };
             tick();
+        }
+
+        // The popular order is left: its ranking stops and pixiv's own flag comes back.
+        function leavePopular() {
+            stopEngines();
+            premiumView.set(false);
         }
 
         function onClickCapture(event) {
@@ -2903,10 +2999,17 @@
                 pageWatch.schedule();
                 if (!isPopularPage()) return;
                 sortSwitch.remember(byKeyboard);
-                stopEngines();
-                statsCache.flush();
                 const url = new URL(location.href);
                 url.searchParams.delete('p');
+                // A search reloads in pixiv's own order and enters the popular order
+                // from there (see restoreInitialOrder).
+                const order = url.searchParams.get('order');
+                if (popularKind(location.href) === 'search' && POPULAR_ORDERS.has(order)) {
+                    url.searchParams.delete('order');
+                    if (!rememberEnterOrder(url.href, order)) url.searchParams.set('order', order);
+                }
+                stopEngines();
+                statsCache.flush();
                 location.replace(url.href);
             },
 
@@ -3181,10 +3284,7 @@
             const onLocation = () => {
                 if (location.href === lastHref) return;
                 lastHref = location.href;
-                if (!isPopularPage()) {
-                    stopEngines();
-                    premiumView.set(false);
-                }
+                if (!isPopularPage() && !restoringOrder) leavePopular();
                 pageWatch.update();
                 ui.scheduleRender();
             };
