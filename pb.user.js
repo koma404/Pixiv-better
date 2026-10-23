@@ -3,8 +3,8 @@
 // @name:ru        Pixiv Sort
 // @name:ja        Pixiv Sort
 // @name:zh-CN     Pixiv Sort
-// @namespace      vasyok100
-// @version        1.3.3
+// @namespace      https://github.com/koma404/Pixiv-better
+// @version        1.3.4
 // @description    Makes pixiv's own "Sort by popularity" work without Premium, and adds it to artist pages and bookmarks. Works are ranked right in your browser by real bookmark counts, as pixiv does, or by views.
 // @description:ru Включает штатную «Сортировку по популярности» на pixiv без Premium и добавляет её на страницы авторов и в закладки. Работы ранжируются прямо в браузере по реальному числу закладок, как у самого pixiv, или по просмотрам.
 // @description:ja pixiv 標準の「人気順」を Premium なしで使えるようにし、ユーザーページとブックマークにも追加します。pixiv と同じく実際のブックマーク数で、または閲覧数でブラウザ内で並べ替えます。
@@ -16,11 +16,14 @@
 // @run-at         document-start
 // @noframes
 // @grant          none
-// @downloadURL https://update.greasyfork.org/scripts/600266/Pixiv%20Sort.user.js
-// @updateURL https://update.greasyfork.org/scripts/600266/Pixiv%20Sort.meta.js
+// @homepageURL    https://github.com/koma404/Pixiv-better
+// @downloadURL    https://raw.githubusercontent.com/koma404/Pixiv-better/main/pb.user.js
+// @updateURL      https://raw.githubusercontent.com/koma404/Pixiv-better/main/pb.user.js
 // ==/UserScript==
 
 // Copyright (c) 2026 vasyok100. Released under the MIT License.
+// Based on vasyok100's Pixiv Sort (https://greasyfork.org/scripts/600266), with fixes:
+// https://github.com/koma404/Pixiv-better
 
 // How it works
 // 1. A click on pixiv's own "Sort by popularity" chip or dropdown item is caught
@@ -201,6 +204,8 @@
         const STATS_DB_VERSION = 2;
         const STATS_STORE = 'stats';
         const LISTING_STORE = 'listing';
+        // How long an upgrade blocked by another tab is waited for.
+        const DB_BLOCKED_WAIT_MS = 3000;
         // Counts are kept by how fast they still change (a volatility-based TTL): a day
         // for works under a month old, three days under a year, a week for older works,
         // whose counts barely move.
@@ -915,10 +920,21 @@
                 if (!this.opening) {
                     this.opening = new Promise((resolve) => {
                         let request;
+                        let settled = false;
+                        // A database that opens after we gave up is closed again, so it
+                        // doesn't block another tab's upgrade.
+                        const finish = (db) => {
+                            if (settled) {
+                                if (db) db.close();
+                                return;
+                            }
+                            settled = true;
+                            resolve(db);
+                        };
                         try {
                             request = indexedDB.open(STATS_DB, STATS_DB_VERSION);
                         } catch (e) {
-                            resolve(null);
+                            finish(null);
                             return;
                         }
                         request.onupgradeneeded = () => {
@@ -928,13 +944,23 @@
                         };
                         request.onsuccess = () => {
                             const db = request.result;
-                            // A newer version of the script in another tab may upgrade it.
-                            db.onversionchange = () => db.close();
+                            if (settled) {
+                                db.close();
+                                return;
+                            }
+                            // A newer version of the script in another tab may upgrade it,
+                            // or the browser may delete it; a later open() starts over.
+                            db.onversionchange = () => {
+                                db.close();
+                                this.opening = null;
+                            };
                             this.dropExpiredListings(db);
-                            resolve(db);
+                            finish(db);
                         };
-                        request.onerror = () => resolve(null);
-                        request.onblocked = () => resolve(null);
+                        request.onerror = () => finish(null);
+                        // An older tab holding the database usually closes it at once
+                        // (onversionchange); one that doesn't must not hold this tab up.
+                        request.onblocked = () => setTimeout(() => finish(null), DB_BLOCKED_WAIT_MS);
                     });
                 }
                 return this.opening;
@@ -1070,7 +1096,8 @@
             // Counts that arrived since the last flush: to the other tabs, and to
             // IndexedDB in one transaction.
             flush() {
-                if (!this.pending.size) return;
+                // Kept until the cache has loaded, then sent and stored once.
+                if (!this.pending.size || (!this.db && !this.loaded)) return;
                 const records = [...this.pending.values()];
                 if (this.channel) {
                     try {
@@ -1080,7 +1107,7 @@
                     }
                 }
                 if (!this.db) {
-                    if (this.loaded) this.pending.clear();
+                    this.pending.clear();
                     return;
                 }
                 try {
@@ -1215,11 +1242,20 @@
             },
         };
 
-        // Runs fn over items with at most `limit` calls in flight.
+        // Runs fn over items with at most `limit` calls in flight. After a failure no
+        // new calls start; the ones in flight finish.
         async function mapLimit(items, limit, fn) {
             let next = 0;
+            let failed = false;
             const worker = async () => {
-                while (next < items.length) await fn(items[next++]);
+                while (!failed && next < items.length) {
+                    try {
+                        await fn(items[next++]);
+                    } catch (error) {
+                        failed = true;
+                        throw error;
+                    }
+                }
             };
             await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
         }
@@ -1331,13 +1367,16 @@
                 return Math.max(0, counts <= hardLeft ? counts : PAGE_MAX_WAIT_MS - waited);
             }
 
-            async untilStalled() {
+            // `wait.done` is set once the page is served, also when the counts won the
+            // race, so the loop doesn't keep polling after it.
+            async untilStalled(wait) {
                 const started = Date.now();
                 this.waitStarted = started;
                 this.emit();
                 for (;;) {
-                    if (this.hurried) return;
+                    if (this.hurried || wait.done) return;
                     await delay(250);
+                    if (wait.done) return;
                     const now = Date.now();
                     const left = PAGE_MAX_WAIT_MS + PAGE_GRACE_MS - (now - started);
                     if (now - this.lastActivity >= PAGE_STALL_MS || left <= 0 || this.signal.aborted) return;
@@ -1389,7 +1428,8 @@
                     statsFailed: false,
                     floor: Math.max(floor || 0, tagFloor(item)),
                 });
-                if (taken.stats) this.noteStats(taken.stats);
+                // Works the viewer's settings hide go last and must not raise the threshold.
+                if (taken.stats && !taken.unviewable) this.noteStats(taken.stats);
                 return taken;
             }
 
@@ -1543,12 +1583,25 @@
             // Waits for every queued count. The bound of a skipped work grows with the
             // ratio to bookmarks measured meanwhile (views, likes), so skipped works are
             // checked again each round and counted if they could now reach the pages.
+            // Several callers can wait at once (two pages of a list asked for together),
+            // so the counts each one waits for stay listed until they have settled.
             async countsSettled() {
                 for (;;) {
                     this.requeueSkipped();
-                    if (!this.pendingStats.length) return;
-                    await Promise.all(this.pendingStats.splice(0));
+                    const pending = this.pendingStats.slice();
+                    if (!pending.length) return;
+                    await Promise.all(pending);
+                    const settled = new Set(pending);
+                    this.pendingStats = this.pendingStats.filter((done) => !settled.has(done));
                 }
+            }
+
+            // A new "Parallel requests" setting applies to the running ranking too;
+            // more requests come one at a time, as after a throttle.
+            setConcurrency(concurrency) {
+                this.concurrency = concurrency;
+                this.limit = Math.min(this.limit, concurrency);
+                this.pumpStats();
             }
 
             // Pages already handed to pixiv stay fixed; everything after them is re-sorted,
@@ -1812,7 +1865,9 @@
                         return true;
                     }
                     if (!page.items.length) return true;
-                    source.buffer = page.items;
+                    // A copy: the page is shared with listingCache, and the buffer is
+                    // emptied as works are taken.
+                    source.buffer = page.items.slice();
                 }
             }
 
@@ -1999,11 +2054,18 @@
 
             async getPage(page) {
                 clearTimeout(this.prefetchTimer);
-                const end = Math.min(page, this.lastPage || page) * PAGE_SIZE;
+                // Past the ranked pages there is nothing to rank for.
+                if (page > this.lastPage) return [];
+                const end = page * PAGE_SIZE;
                 // Exact counts can take long when pixiv throttles: once the page is filled
                 // and requests stall, it is served by estimate; the rest keeps loading.
                 this.waitStarted = 0;
-                await Promise.race([this.ensure(end), this.waitForRanked(end).then(() => this.untilStalled())]);
+                const wait = { done: false };
+                try {
+                    await Promise.race([this.ensure(end), this.waitForRanked(end).then(() => this.untilStalled(wait))]);
+                } finally {
+                    wait.done = true;
+                }
                 this.waitStarted = 0;
                 this.hurried = false;
                 this.resortTail();
@@ -2013,7 +2075,6 @@
                         this.ensure(end + PAGE_SIZE).catch(() => {});
                     }, PREFETCH_DELAY_MS);
                 }
-                if (page > this.lastPage) return [];
                 return this.ranked.slice(end - PAGE_SIZE, end).map(stripInternal);
             }
 
@@ -2129,13 +2190,26 @@
                 const end = offset + limit;
                 this.target = Math.max(this.target, end);
                 this.waitStarted = 0;
-                await Promise.race([this.countsSettled(), this.untilStalled()]);
+                const settled = this.countsSettled();
+                settled.catch(() => {});
+                const wait = { done: false };
+                try {
+                    await Promise.race([settled, this.untilStalled(wait)]);
+                } finally {
+                    wait.done = true;
+                }
                 this.waitStarted = 0;
                 this.hurried = false;
                 this.resortTail();
                 this.served = Math.max(this.served, Math.min(end, this.ranked.length));
                 if (!this.statsQueue.length && !this.statsActive) this.state.phase = 'ready';
                 this.emit();
+                // Served by estimate: the counts still loading end the ranking later.
+                settled.then(() => {
+                    if (this.state.phase !== 'ranking' || this.statsQueue.length || this.statsActive) return;
+                    this.state.phase = 'ready';
+                    this.emit();
+                }, () => {});
                 const page = this.ranked.slice(offset, end);
                 return byIds ? this.answerIds(request, page) : this.answerOffset(fetchOriginal, page);
             }
@@ -2801,6 +2875,7 @@
             onSettingsChange() {
                 updateSettings({ concurrency: this.concurrencyInput.value, badges: this.badgesInput.checked });
                 this.syncControls();
+                if (activeEngine) activeEngine.setConcurrency(settings.concurrency);
                 pageWatch.update();
             },
 
