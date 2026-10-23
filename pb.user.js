@@ -4,7 +4,7 @@
 // @name:ja        Pixiv Sort
 // @name:zh-CN     Pixiv Sort
 // @namespace      https://github.com/koma404/Pixiv-better
-// @version        1.3.4
+// @version        1.3.5
 // @description    Makes pixiv's own "Sort by popularity" work without Premium, and adds it to artist pages and bookmarks. Works are ranked right in your browser by real bookmark counts, as pixiv does, or by views.
 // @description:ru Включает штатную «Сортировку по популярности» на pixiv без Premium и добавляет её на страницы авторов и в закладки. Работы ранжируются прямо в браузере по реальному числу закладок, как у самого pixiv, или по просмотрам.
 // @description:ja pixiv 標準の「人気順」を Premium なしで使えるようにし、ユーザーページとブックマークにも追加します。pixiv と同じく実際のブックマーク数で、または閲覧数でブラウザ内で並べ替えます。
@@ -64,12 +64,16 @@
     // in the page itself, whatever context the userscript manager uses.
     function injectPageWorld() {
         const inject = () => {
-            const script = document.createElement('script');
-            script.textContent = `(${pageWorld.toString()})();`;
-            (document.head || document.documentElement).appendChild(script);
-            script.remove();
-            // Without inline scripts (e.g. a future CSP) run it here as a best effort.
-            if (document.documentElement.getAttribute('data-pixiv-sort') !== 'page') pageWorld();
+            const root = document.head || document.documentElement;
+            if (root) {
+                const script = document.createElement('script');
+                script.textContent = `(${pageWorld.toString()})();`;
+                root.appendChild(script);
+                script.remove();
+            }
+            // Without inline scripts (e.g. a future CSP, or no root element to
+            // attach to) run it here as a best effort.
+            if (!document.documentElement || document.documentElement.getAttribute('data-pixiv-sort') !== 'page') pageWorld();
         };
         if (document.documentElement) inject();
         else document.addEventListener('readystatechange', inject, { once: true });
@@ -89,7 +93,14 @@
 
         if (window.__pixivSortInstalled) return;
         window.__pixivSortInstalled = true;
-        document.documentElement.setAttribute('data-pixiv-sort', 'page');
+        // At document-start <html> may not exist yet (no documentElement, and
+        // document.documentElement === null). The flag is only a marker for
+        // injectPageWorld, so record it whenever the element appears.
+        const mark = () => {
+            if (document.documentElement) document.documentElement.setAttribute('data-pixiv-sort', 'page');
+        };
+        if (document.documentElement) mark();
+        else document.addEventListener('readystatechange', mark, { once: true });
 
         const nativeFetch = window.fetch;
         // The URL the page was opened with: pixiv's client drops order=popular_* from
@@ -364,7 +375,7 @@
         };
 
         const LANG = (function () {
-            const candidates = [...(navigator.languages || []), navigator.language, document.documentElement.lang];
+            const candidates = [...(navigator.languages || []), navigator.language, document.documentElement && document.documentElement.lang];
             for (const candidate of candidates) {
                 const prefix = String(candidate || '').toLowerCase().slice(0, 2);
                 if (MESSAGES[prefix]) return prefix;
